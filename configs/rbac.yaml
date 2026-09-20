@@ -1,0 +1,35 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: offline-scheduler-role
+  namespace: offline-job
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get","list","watch","create","delete"]
+- apiGroups: ["core"]
+  resources: ["pods","nodes"]
+  verbs: ["get","list","watch"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get","list","watch","create","update","delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: offline-scheduler-rb
+  namespace: offline-job
+subjects:
+- kind: ServiceAccount
+  name: offline-scheduler-sa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: offline-scheduler-role
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: offline-scheduler-sa
+  namespace: offline-job
+

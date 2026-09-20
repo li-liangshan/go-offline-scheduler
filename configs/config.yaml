@@ -1,0 +1,10 @@
+namespace: offline-job
+globalMaxConcurrency: 50
+httpListenAddr: ":8080"
+natsUrl: "nats://127.0.0.1:4222"
+pebbleDataPath: "./pebble-data"
+backupDir: "./pebble-backup"
+leaseName: offline-scheduler-leader
+otelEndpoint: "otel-collector:4318"
+logLevel: info
+
