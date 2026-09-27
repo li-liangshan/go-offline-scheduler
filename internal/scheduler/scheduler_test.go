@@ -1,10 +1,12 @@
 package scheduler
 
 import (
+	"container/heap"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"offline-scheduler/internal/model"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestPriorityQueue(t *testing.T) {
@@ -17,4 +19,3 @@ func TestPriorityQueue(t *testing.T) {
 	top := heap.Pop(&pq).(*PriorityTaskItem)
 	assert.Equal(t, "t2", top.task.TaskID)
 }
-

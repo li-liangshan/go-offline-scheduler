@@ -2,16 +2,13 @@ package scheduler
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"offline-scheduler/internal/logger"
 )
@@ -156,4 +153,3 @@ func (ji *JobInformer) GetCachedJob(jobName string) (*batchv1.Job, bool) {
 	}
 	return val.(*batchv1.Job), true
 }
-

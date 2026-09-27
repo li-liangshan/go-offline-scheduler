@@ -11,10 +11,10 @@ const (
 
 // 任务状态
 const (
-	TaskStatusPending   = "pending"
-	TaskStatusSuccess   = "success"
-	TaskStatusFailed    = "failed"
-	TaskStatusCanceled  = "canceled"
+	TaskStatusPending  = "pending"
+	TaskStatusSuccess  = "success"
+	TaskStatusFailed   = "failed"
+	TaskStatusCanceled = "canceled"
 )
 
 // 分片状态
@@ -61,4 +61,3 @@ type TaskShard struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }
-

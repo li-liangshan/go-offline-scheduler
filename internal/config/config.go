@@ -27,4 +27,3 @@ func LoadConfig(path string) (*AppConfig, error) {
 	err = viper.Unmarshal(&cfg)
 	return &cfg, err
 }
-

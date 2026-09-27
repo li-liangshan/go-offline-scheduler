@@ -8,17 +8,18 @@ import (
 	"syscall"
 	"time"
 
+	"flag"
+
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
-	"flag"
 
 	"offline-scheduler/internal/api"
 	"offline-scheduler/internal/config"
 	"offline-scheduler/internal/leader"
 	"offline-scheduler/internal/logger"
-	"offline-scheduler/internal/metric"
+	"offline-scheduler/internal/model"
 	"offline-scheduler/internal/otel"
 	"offline-scheduler/internal/queue"
 	"offline-scheduler/internal/resourcecheck"
@@ -86,7 +87,7 @@ func main() {
 	}
 	defer st.Close()
 
-	backupMgr, err := store.NewBackupManager(st.DB(), cfg.BackupDir)
+	backupMgr, err := store.NewBackupManager(st.DB(), cfg.BackupDir, 100, 100*time.Second)
 	if err != nil {
 		logger.L.Fatal("backup manager create failed", zap.Error(err))
 	}
@@ -98,7 +99,7 @@ func main() {
 
 	// 7.调度器
 	sched := scheduler.NewScheduler(kubeClient, st, resChecker, cfg.Namespace, cfg.GlobalMaxConcurrency)
-	sched.startShardTimeoutChecker() // 启动分片超时巡检
+	sched.StartShardTimeoutChecker() // 启动分片超时巡检
 
 	// 8.Job informer
 	jobInformer := scheduler.NewJobInformer(kubeClient, cfg.Namespace, sched.OnJobStatusUpdate)
@@ -110,8 +111,9 @@ func main() {
 
 	// 9.Leader选举：只有leader启动调度Run()
 	var leaderElector *leader.LeaderElector
-	leaderElector, err = leader.NewLeaderElector(kubeClient, cfg.Namespace, cfg.LeaseName,
-		func() {
+	var c = leader.Config{}
+	leaderElector, err = leader.NewLeaderElector(kubeClient, c, cfg.Namespace, cfg.LeaseName,
+		func(ctx context.Context) {
 			// 当选leader，启动调度循环
 			sched.Run()
 		},
@@ -167,4 +169,3 @@ func main() {
 	backupMgr.Stop()
 	logger.S.Info("offline scheduler exit gracefully")
 }
-

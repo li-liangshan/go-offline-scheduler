@@ -33,33 +33,34 @@ func (h *HttpServer) SubmitTaskHandler(w http.ResponseWriter, r *http.Request) {
 	var req model.SubmitTaskRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]any{"code":400,"msg":"bad request"})
+		json.NewEncoder(w).Encode(map[string]any{"code": 400, "msg": "bad request"})
 		return
 	}
 	err := h.sched.SubmitTask(&req)
 	if err != nil {
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]any{"code":500,"msg":err.Error()})
+		json.NewEncoder(w).Encode(map[string]any{"code": 500, "msg": err.Error()})
 		return
 	}
 	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(map[string]any{"code":200,"msg":"success"})
+	json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "success"})
 }
 
 func (h *HttpServer) CancelTaskHandler(w http.ResponseWriter, r *http.Request) {
-	var req struct{ TaskID string `json:"taskId"` }
+	var req struct {
+		TaskID string `json:"taskId"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]any{"code":400,"msg":"bad request"})
+		json.NewEncoder(w).Encode(map[string]any{"code": 400, "msg": "bad request"})
 		return
 	}
 	err := h.sched.CancelTask(req.TaskID)
 	if err != nil {
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]any{"code":500,"msg":err.Error()})
+		json.NewEncoder(w).Encode(map[string]any{"code": 500, "msg": err.Error()})
 		return
 	}
 	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(map[string]any{"code":200,"msg":"success"})
+	json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "success"})
 }
-

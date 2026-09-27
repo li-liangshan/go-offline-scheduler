@@ -9,16 +9,16 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"offline-scheduler/internal/logger"
 	"offline-scheduler/internal/metric"
 	"offline-scheduler/internal/model"
 	"offline-scheduler/internal/resourcecheck"
 	"offline-scheduler/internal/store"
-	"offline-scheduler/internal/logger"
+
 	"go.uber.org/zap"
 )
 
@@ -55,11 +55,11 @@ func (pq *PriorityQueue) Pop() interface{} {
 }
 
 type Scheduler struct {
-	k8sClient     kubernetes.Interface
-	store         *store.Store
-	resChecker    *resourcecheck.ResourceChecker
-	namespace     string
-	jobInformer   *JobInformer
+	k8sClient   kubernetes.Interface
+	store       *store.Store
+	resChecker  *resourcecheck.ResourceChecker
+	namespace   string
+	jobInformer *JobInformer
 
 	priorityQueue PriorityQueue
 	queueMu       sync.Mutex
@@ -68,20 +68,20 @@ type Scheduler struct {
 	runningShards  int
 	runningMu      sync.Mutex
 
-	ctx                   context.Context
-	cancelFunc            context.CancelFunc
-	wg                    sync.WaitGroup
-	timeoutCheckerTicker  *time.Ticker
+	ctx                  context.Context
+	cancelFunc           context.CancelFunc
+	wg                   sync.WaitGroup
+	timeoutCheckerTicker *time.Ticker
 }
 
 func NewScheduler(k8sClient kubernetes.Interface, st *store.Store, rc *resourcecheck.ResourceChecker, ns string, globalMaxConcurrency int) *Scheduler {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
-		k8sClient:     k8sClient,
-		store:         st,
-		resChecker:    rc,
-		namespace:     ns,
-		priorityQueue: make(PriorityQueue, 0),
+		k8sClient:      k8sClient,
+		store:          st,
+		resChecker:     rc,
+		namespace:      ns,
+		priorityQueue:  make(PriorityQueue, 0),
 		maxConcurrency: globalMaxConcurrency,
 		ctx:            ctx,
 		cancelFunc:     cancel,
@@ -94,7 +94,7 @@ func (s *Scheduler) SetInformer(ji *JobInformer) {
 }
 
 // startShardTimeoutChecker 分片超时巡检后台协程
-func (s *Scheduler) startShardTimeoutChecker() {
+func (s *Scheduler) StartShardTimeoutChecker() {
 	s.wg.Add(1)
 	s.timeoutCheckerTicker = time.NewTicker(10 * time.Second)
 	go func() {
@@ -354,9 +354,9 @@ func (s *Scheduler) buildK8sJob(task *model.OfflineTask, shard *model.TaskShard)
 			Name:      shard.K8sJobName,
 			Namespace: s.namespace,
 			Labels: map[string]string{
-				"task-id":     task.TaskID,
-				"shard-id":    shard.ShardID,
-				"app":         "offline-worker",
+				"task-id":  task.TaskID,
+				"shard-id": shard.ShardID,
+				"app":      "offline-worker",
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -530,4 +530,3 @@ func min(a, b, c int) int {
 	}
 	return m
 }
-

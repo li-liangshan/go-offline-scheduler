@@ -21,4 +21,3 @@ func InitLogger() {
 func Sync() {
 	_ = L.Sync()
 }
-

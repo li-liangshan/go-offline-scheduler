@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"offline-scheduler/internal/logger"
 	"offline-scheduler/internal/model"
+
+	"github.com/nats-io/nats.go"
 )
 
 type NatsQueue struct {
@@ -103,4 +104,3 @@ func (n *NatsQueue) Close() {
 	}
 	n.nc.Close()
 }
-

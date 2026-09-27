@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"offline-scheduler/internal/model"
@@ -25,7 +26,7 @@ func NewResourceChecker(client kubernetes.Interface, ns string) *ResourceChecker
 
 // Check 简单资源预校验：查询集群可分配资源，这里为简易实现，生产可增强
 func (r *ResourceChecker) Check(task *model.OfflineTask, cpu, mem resource.Quantity) (bool, error) {
-	nodes, err := r.client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	nodes, err := r.client.CoreV1().Nodes().List(context.Background(), v1.ListOptions{})
 	if err != nil {
 		return false, err
 	}
@@ -41,4 +42,3 @@ func (r *ResourceChecker) Check(task *model.OfflineTask, cpu, mem resource.Quant
 	}
 	return true, nil
 }
-

@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cockroachdb/pebble"
+	"offline-scheduler/internal/logger"
 	"offline-scheduler/internal/model"
+
+	"github.com/cockroachdb/pebble"
+	"go.uber.org/zap"
 )
 
 // 前缀区分不同KV
@@ -95,10 +98,14 @@ func (s *Store) GetShard(shardId string) (*model.TaskShard, error) {
 // ListShardsByTaskID 根据taskId查询所有分片
 func (s *Store) ListShardsByTaskID(taskId string) ([]*model.TaskShard, error) {
 	var list []*model.TaskShard
-	iter := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte(prefixShard),
 		UpperBound: []byte(prefixShard + "\xff"),
 	})
+	if err != nil {
+		logger.L.Error("pebble list shards fail", zap.Error(err))
+		return nil, err
+	}
 	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -117,10 +124,14 @@ func (s *Store) ListShardsByTaskID(taskId string) ([]*model.TaskShard, error) {
 // ListAllRunningShards 查询所有运行中的分片（超时巡检使用）
 func (s *Store) ListAllRunningShards() ([]*model.TaskShard, error) {
 	var list []*model.TaskShard
-	iter := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte(prefixShard),
 		UpperBound: []byte(prefixShard + "\xff"),
 	})
+	if err != nil {
+		logger.L.Error("pebble list all running shards fail", zap.Error(err))
+		return nil, err
+	}
 	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -135,4 +146,3 @@ func (s *Store) ListAllRunningShards() ([]*model.TaskShard, error) {
 	}
 	return list, nil
 }
-
