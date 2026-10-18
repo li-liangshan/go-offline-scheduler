@@ -39,11 +39,15 @@ func buildKubeClient() (*kubernetes.Clientset, error) {
 	}
 	flag.Parse()
 
+	return buildKubeClientFromKubeconfig(*kubeconfig)
+}
+
+func buildKubeClientFromKubeconfig(kubeconfig string) (*kubernetes.Clientset, error) {
 	// 集群内优先InClusterConfig
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		// 本地开发读取kubeconfig
-		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
 			return nil, err
 		}
@@ -68,11 +72,14 @@ func main() {
 	logger.S.Info("offline-scheduler starting")
 
 	// 3.链路追踪
-	tp, err := otel.InitTrace("offline-scheduler")
+	tp, err := otel.InitTrace("offline-scheduler", cfg.OtelEndpoint)
 	if err != nil {
 		logger.S.Warn("otel trace init failed", zap.Error(err))
+	} else {
+		defer func() {
+			_ = tp.Shutdown(context.Background())
+		}()
 	}
-	defer tp.Shutdown(context.Background())
 
 	// 4.k8s client
 	kubeClient, err := buildKubeClient()
@@ -99,20 +106,31 @@ func main() {
 
 	// 7.调度器
 	sched := scheduler.NewScheduler(kubeClient, st, resChecker, cfg.Namespace, cfg.GlobalMaxConcurrency)
-	sched.StartShardTimeoutChecker() // 启动分片超时巡检
 
 	// 8.Job informer
 	jobInformer := scheduler.NewJobInformer(kubeClient, cfg.Namespace, sched.OnJobStatusUpdate)
 	sched.SetInformer(jobInformer)
 	jobInformer.Run()
+	cacheSyncDeadline := time.After(30 * time.Second)
 	for !jobInformer.HasSynced() {
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-cacheSyncDeadline:
+			logger.L.Fatal("job informer cache sync timeout")
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
 	// 9.Leader选举：只有leader启动调度Run()
-	var leaderElector *leader.LeaderElector
-	var c = leader.Config{}
-	leaderElector, err = leader.NewLeaderElector(kubeClient, c, cfg.Namespace, cfg.LeaseName,
+	identity := os.Getenv("POD_NAME")
+	if identity == "" {
+		identity, _ = os.Hostname()
+	}
+	leaderCfg := leader.Config{
+		Namespace: cfg.Namespace,
+		LeaseName: cfg.LeaseName,
+		Identity:  identity,
+	}
+	leaderElector, err := leader.NewLeaderElector(kubeClient, leaderCfg,
 		func(ctx context.Context) {
 			// 当选leader，启动调度循环
 			sched.Run()

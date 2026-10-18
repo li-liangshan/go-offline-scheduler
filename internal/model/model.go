@@ -19,10 +19,11 @@ const (
 
 // 分片状态
 const (
-	ShardStatusPending = "pending"
-	ShardStatusRunning = "running"
-	ShardStatusSuccess = "success"
-	ShardStatusFailed  = "failed"
+	ShardStatusPending  = "pending"
+	ShardStatusRunning  = "running"
+	ShardStatusSuccess  = "success"
+	ShardStatusFailed   = "failed"
+	ShardStatusCanceled = "canceled"
 )
 
 type SubmitTaskRequest struct {
@@ -37,27 +38,27 @@ type SubmitTaskRequest struct {
 }
 
 type OfflineTask struct {
-	TaskID      string
-	TotalShard  int
-	Concurrency int
-	MaxRetry    int
-	TimeoutSec  int64
-	Params      map[string]string
-	Labels      map[string]string
-	Priority    int
-	Status      string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	TaskID      string            `json:"taskId"`
+	TotalShard  int               `json:"totalShard"`
+	Concurrency int               `json:"concurrency"`
+	MaxRetry    int               `json:"maxRetry"`
+	TimeoutSec  int64             `json:"timeoutSec"`
+	Params      map[string]string `json:"params,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Priority    int               `json:"priority"`
+	Status      string            `json:"status"`
+	CreatedAt   time.Time         `json:"createdAt"`
+	UpdatedAt   time.Time         `json:"updatedAt"`
 }
 
 type TaskShard struct {
-	ShardID    string
-	TaskID     string
-	ShardIndex int
-	K8sJobName string
-	Status     string
-	RetryCount int
-	StartedAt  time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ShardID    string    `json:"shardId"`
+	TaskID     string    `json:"taskId"`
+	ShardIndex int       `json:"shardIndex"`
+	K8sJobName string    `json:"k8sJobName,omitempty"`
+	Status     string    `json:"status"`
+	RetryCount int       `json:"retryCount"`
+	StartedAt  time.Time `json:"startedAt,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }

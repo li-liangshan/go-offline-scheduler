@@ -11,9 +11,12 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
-func InitTrace(serviceName string) (*tracesdk.TracerProvider, error) {
+func InitTrace(serviceName, endpoint string) (*tracesdk.TracerProvider, error) {
+	if endpoint == "" {
+		endpoint = "otel-collector:4318"
+	}
 	exporter, err := otlptracehttp.New(context.Background(),
-		otlptracehttp.WithEndpoint("otel-collector:4318"),
+		otlptracehttp.WithEndpoint(endpoint),
 		otlptracehttp.WithInsecure(),
 	)
 	if err != nil {

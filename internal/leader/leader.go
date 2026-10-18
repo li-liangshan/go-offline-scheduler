@@ -3,6 +3,7 @@ package leader
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -38,7 +39,7 @@ type Config struct {
 	RetryPeriod   time.Duration
 }
 
-func NewLeaderElector(client kubernetes.Interface, cfg Config, ns, leaseName string, becomeLeader func(context.Context), loseLeader func()) (*LeaderElector, error) {
+func NewLeaderElector(client kubernetes.Interface, cfg Config, becomeLeader func(context.Context), loseLeader func()) (*LeaderElector, error) {
 	if client == nil {
 		return nil, fmt.Errorf("kubernetes client cannot be nil")
 	}
@@ -57,19 +58,13 @@ func NewLeaderElector(client kubernetes.Interface, cfg Config, ns, leaseName str
 	}
 	if cfg.Identity == "" {
 		// fallback，生产环境优先传入pod name
-		cfg.Identity = fmt.Sprintf("offline-scheduler-%d", time.Now().UnixNano())
+		if hostname, err := os.Hostname(); err == nil && hostname != "" {
+			cfg.Identity = hostname
+		} else {
+			cfg.Identity = fmt.Sprintf("offline-scheduler-%d", time.Now().UnixNano())
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	// lock := &resourcelock.LeaseLock{
-	// 	LeaseMeta: metav1.ObjectMeta{
-	// 		Name:      leaseName,
-	// 		Namespace: ns,
-	// 	},
-	// 	Client: client.CoordinationV1(),
-	// 	LockConfig: resourcelock.ResourceLockConfig{
-	// 		Identity: "offline-scheduler-" + fmt.Sprintf("%d", time.Now().UnixNano()),
-	// 	},
-	// }
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      cfg.LeaseName,
@@ -92,9 +87,9 @@ func NewLeaderElector(client kubernetes.Interface, cfg Config, ns, leaseName str
 	leCfg := leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
-		LeaseDuration:   15 * time.Second,
-		RenewDeadline:   10 * time.Second,
-		RetryPeriod:     2 * time.Second,
+		LeaseDuration:   cfg.LeaseDuration,
+		RenewDeadline:   cfg.RenewDeadline,
+		RetryPeriod:     cfg.RetryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				logger.S.Info("become leader")

@@ -31,6 +31,7 @@ func NewNatsQueue(url string) (*NatsQueue, error) {
 	}
 	js, err := nc.JetStream()
 	if err != nil {
+		nc.Close()
 		return nil, err
 	}
 
@@ -65,8 +66,8 @@ func (n *NatsQueue) Subscribe(ctx context.Context, handler func(*model.SubmitTas
 		err := handler(&req)
 		if err != nil {
 			// 失败，重试3次，超过转入DLQ
-			meta, _ := msg.Metadata()
-			if meta.NumDelivered >= 3 {
+			meta, metaErr := msg.Metadata()
+			if metaErr == nil && meta.NumDelivered >= 3 {
 				// 死信
 				_, _ = n.js.Publish(dlqSubject, msg.Data)
 				_ = msg.Ack()
@@ -91,6 +92,9 @@ func (n *NatsQueue) Subscribe(ctx context.Context, handler func(*model.SubmitTas
 		// 可在这里增加重入调度器逻辑
 		_ = msg.Ack()
 	}, nats.Durable("offline-dlq-consumer"), nats.ManualAck())
+	if err != nil {
+		return err
+	}
 	n.dlqSub = dlqSub
 	return nil
 }

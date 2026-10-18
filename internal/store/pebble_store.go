@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"offline-scheduler/internal/logger"
@@ -15,6 +16,13 @@ import (
 const (
 	prefixTask  = "task:"
 	prefixShard = "shard:"
+)
+
+var (
+	// ErrTaskNotFound 任务不存在
+	ErrTaskNotFound = errors.New("task not found")
+	// ErrShardNotFound 分片不存在
+	ErrShardNotFound = errors.New("shard not found")
 )
 
 type Store struct {
@@ -47,12 +55,36 @@ func (s *Store) SaveTask(t *model.OfflineTask) error {
 	return s.db.Set(key, val, pebble.Sync)
 }
 
+// SaveTaskWithShards 原子地保存任务及其全部分片，避免任务已入库但分片缺失。
+func (s *Store) SaveTaskWithShards(t *model.OfflineTask, shards []*model.TaskShard) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	taskVal, err := json.Marshal(t)
+	if err != nil {
+		return err
+	}
+	if err := batch.Set([]byte(prefixTask+t.TaskID), taskVal, nil); err != nil {
+		return err
+	}
+	for _, shard := range shards {
+		shardVal, err := json.Marshal(shard)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set([]byte(prefixShard+shard.ShardID), shardVal, nil); err != nil {
+			return err
+		}
+	}
+	return batch.Commit(pebble.Sync)
+}
+
 // GetTask 获取任务
 func (s *Store) GetTask(taskId string) (*model.OfflineTask, error) {
 	key := []byte(prefixTask + taskId)
 	val, closer, err := s.db.Get(key)
-	if err == pebble.ErrNotFound {
-		return nil, fmt.Errorf("task not found")
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskId)
 	}
 	if err != nil {
 		return nil, err
@@ -80,8 +112,8 @@ func (s *Store) SaveShard(shard *model.TaskShard) error {
 func (s *Store) GetShard(shardId string) (*model.TaskShard, error) {
 	key := []byte(prefixShard + shardId)
 	val, closer, err := s.db.Get(key)
-	if err == pebble.ErrNotFound {
-		return nil, fmt.Errorf("shard not found")
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, fmt.Errorf("%w: %s", ErrShardNotFound, shardId)
 	}
 	if err != nil {
 		return nil, err

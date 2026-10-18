@@ -68,7 +68,7 @@ func NewJobInformer(client kubernetes.Interface, ns string, callback func(job *b
 
 func (ji *JobInformer) onAdd(obj interface{}) {
 	job, ok := obj.(*batchv1.Job)
-	if !ok {
+	if !ok || !isManagedJob(job) {
 		return
 	}
 	ji.localCache.Store(job.Name, job)
@@ -76,8 +76,14 @@ func (ji *JobInformer) onAdd(obj interface{}) {
 }
 
 func (ji *JobInformer) onUpdate(oldObj, newObj interface{}) {
-	oldJob := oldObj.(*batchv1.Job)
-	newJob := newObj.(*batchv1.Job)
+	oldJob, ok := oldObj.(*batchv1.Job)
+	if !ok {
+		return
+	}
+	newJob, ok := newObj.(*batchv1.Job)
+	if !ok || !isManagedJob(newJob) {
+		return
+	}
 
 	// resourceVersion没变直接跳过
 	if oldJob.ResourceVersion == newJob.ResourceVersion {
@@ -90,7 +96,14 @@ func (ji *JobInformer) onUpdate(oldObj, newObj interface{}) {
 func (ji *JobInformer) onDelete(obj interface{}) {
 	job, ok := obj.(*batchv1.Job)
 	if !ok {
-		return
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		job, ok = tombstone.Obj.(*batchv1.Job)
+		if !ok {
+			return
+		}
 	}
 	ji.localCache.Delete(job.Name)
 }
@@ -98,38 +111,28 @@ func (ji *JobInformer) onDelete(obj interface{}) {
 // dispatch 过滤非本业务的Job，再执行上层回调
 func (ji *JobInformer) dispatch(job *batchv1.Job) {
 	// 只处理我们调度器创建的job：必须带标签 app=offline‑worker
-	if job.Labels == nil || job.Labels["app"] != "offline-worker" {
-		return
-	}
-	// 必须携带task‑id、shard‑id标签
-	taskId := job.Labels["task-id"]
-	shardId := job.Labels["shard-id"]
-	if taskId == "" || shardId == "" {
+	if !isManagedJob(job) || ji.updateCb == nil {
 		return
 	}
 
 	ji.updateCb(job)
 }
 
-// Run 启动informer，阻塞
+func isManagedJob(job *batchv1.Job) bool {
+	if job == nil || job.Labels == nil || job.Labels["app"] != "offline-worker" {
+		return false
+	}
+	return job.Labels["task-id"] != "" && job.Labels["shard-id"] != ""
+}
+
+// Run 启动informer（非阻塞）
 func (ji *JobInformer) Run() {
 	ji.wg.Add(1)
 	go func() {
 		defer ji.wg.Done()
 		logger.S.Info("job informer starting")
-
-		// 启动informer
 		ji.informer.Run(ji.ctx.Done())
-
-		// 等待cache同步完成
-		if !cache.WaitForCacheSync(ji.ctx.Done(), ji.informer.HasSynced) {
-			logger.L.Error("job informer cache sync failed")
-			return
-		}
-		logger.S.Info("job informer cache synced ok")
-
-		<-ji.ctx.Done()
-		logger.S.Info("job informer receive shutdown signal")
+		logger.S.Info("job informer stopped")
 	}()
 }
 
