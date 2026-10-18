@@ -28,6 +28,10 @@ type BackupManager struct {
 }
 
 func NewBackupManager(db *pebble.DB, backupDir string, retainCount int, timeout time.Duration) (*BackupManager, error) {
+	return NewBackupManagerWithInterval(db, backupDir, retainCount, timeout, time.Hour)
+}
+
+func NewBackupManagerWithInterval(db *pebble.DB, backupDir string, retainCount int, timeout, interval time.Duration) (*BackupManager, error) {
 	if db == nil {
 		return nil, fmt.Errorf("pebble db cannot be nil")
 	}
@@ -37,6 +41,9 @@ func NewBackupManager(db *pebble.DB, backupDir string, retainCount int, timeout 
 	if timeout <= 0 {
 		timeout = time.Minute
 	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
 		return nil, err
 	}
@@ -45,7 +52,7 @@ func NewBackupManager(db *pebble.DB, backupDir string, retainCount int, timeout 
 		backupDir:     backupDir,
 		retention:     retainCount,
 		backupTimeout: timeout,
-		ticker:        time.NewTicker(1 * time.Hour),
+		ticker:        time.NewTicker(interval),
 		stopCh:        make(chan struct{}),
 	}, nil
 }

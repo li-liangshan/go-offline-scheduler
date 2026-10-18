@@ -30,6 +30,10 @@ var (
 		Name: "offline_task_cancel_total",
 		Help: "task canceled count",
 	})
+	TasksDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "offline_task_deleted_total",
+		Help: "terminal tasks deleted by retention policy",
+	})
 	JobCreateOk = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "offline_job_create_ok_total",
 		Help: "k8s job create ok",
@@ -41,5 +45,17 @@ var (
 	ShardLaunchPanic = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "offline_shard_launch_panic_total",
 		Help: "panic when launch shard",
+	})
+	TasksQueued = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "offline_tasks_queued",
+		Help: "number of tasks waiting in the priority queue",
+	})
+	ShardsRunning = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "offline_shards_running",
+		Help: "number of running shards managed by this scheduler",
+	})
+	SchedulerRunning = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "offline_scheduler_running",
+		Help: "whether this instance is actively scheduling",
 	})
 )

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
-	"k8s.io/apimachinery/pkg/fields"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
@@ -34,11 +34,13 @@ func NewJobInformer(client kubernetes.Interface, ns string, callback func(job *b
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// field selector不支持label，使用label selector在ListWatch过滤
-	lw := cache.NewListWatchFromClient(
+	lw := cache.NewFilteredListWatchFromClient(
 		client.BatchV1().RESTClient(),
 		"jobs",
 		ns,
-		fields.Everything(),
+		func(options *metav1.ListOptions) {
+			options.LabelSelector = "app=offline-worker"
+		},
 	)
 
 	informer := cache.NewSharedIndexInformer(

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"offline-scheduler/internal/logger"
 	"offline-scheduler/internal/model"
@@ -23,18 +25,41 @@ var (
 	ErrTaskNotFound = errors.New("task not found")
 	// ErrShardNotFound 分片不存在
 	ErrShardNotFound = errors.New("shard not found")
+	// ErrTaskExists 任务已存在
+	ErrTaskExists = errors.New("task already exists")
 )
 
 type Store struct {
-	db *pebble.DB
+	db      *pebble.DB
+	cache   *pebble.Cache
+	writeMu sync.Mutex
 }
 
 func NewStore(path string) (*Store, error) {
-	db, err := pebble.Open(path, &pebble.Options{})
+	return NewStoreWithCacheMB(path, 64)
+}
+
+// NewStoreWithCacheMB 使用可配置的 block cache 打开 Pebble，便于按 Pod 内存规格调优。
+func NewStoreWithCacheMB(path string, cacheMB int) (*Store, error) {
+	if cacheMB <= 0 {
+		cacheMB = 64
+	}
+	cache := pebble.NewCache(int64(cacheMB) << 20)
+	opts := &pebble.Options{
+		Cache:        cache,
+		MemTableSize: 64 << 20,
+		MaxConcurrentCompactions: func() int {
+			return 2
+		},
+		BytesPerSync:    1 << 20,
+		WALBytesPerSync: 1 << 20,
+	}
+	db, err := pebble.Open(path, opts)
 	if err != nil {
+		cache.Unref()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, cache: cache}, nil
 }
 
 func (s *Store) DB() *pebble.DB {
@@ -42,7 +67,27 @@ func (s *Store) DB() *pebble.DB {
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	if s.cache != nil {
+		s.cache.Unref()
+		s.cache = nil
+	}
+	return err
+}
+
+// Healthy 用于 readiness 探针，确认底层存储仍可正常读取。
+func (s *Store) Healthy() error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("store is not initialized")
+	}
+	_, closer, err := s.db.Get([]byte("__health_check__"))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return closer.Close()
 }
 
 // SaveTask 保存任务
@@ -77,6 +122,18 @@ func (s *Store) SaveTaskWithShards(t *model.OfflineTask, shards []*model.TaskSha
 		}
 	}
 	return batch.Commit(pebble.Sync)
+}
+
+// CreateTaskWithShards 在同一进程内提供幂等创建语义，避免并发提交覆盖已有任务。
+func (s *Store) CreateTaskWithShards(t *model.OfflineTask, shards []*model.TaskShard) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.GetTask(t.TaskID); err == nil {
+		return fmt.Errorf("%w: %s", ErrTaskExists, t.TaskID)
+	} else if !errors.Is(err, ErrTaskNotFound) {
+		return err
+	}
+	return s.SaveTaskWithShards(t, shards)
 }
 
 // GetTask 获取任务
@@ -177,4 +234,109 @@ func (s *Store) ListAllRunningShards() ([]*model.TaskShard, error) {
 		}
 	}
 	return list, nil
+}
+
+// ListTasks 返回全部任务，供 Leader 启动时恢复内存调度队列。
+func (s *Store) ListTasks() ([]*model.OfflineTask, error) {
+	var list []*model.OfflineTask
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(prefixTask),
+		UpperBound: []byte(prefixTask + "\xff"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var task model.OfflineTask
+		if err := json.Unmarshal(iter.Value(), &task); err != nil {
+			continue
+		}
+		list = append(list, &task)
+	}
+	return list, nil
+}
+
+// DeleteTerminalTasksBefore 删除 UpdatedAt 早于 cutoff 的终态任务及其全部分片。
+// 任务和分片通过同一个 Batch 提交，避免清理过程中留下孤立分片。
+func (s *Store) DeleteTerminalTasksBefore(cutoff time.Time) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	expired := make(map[string]struct{})
+	taskIter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(prefixTask),
+		UpperBound: []byte(prefixTask + "\xff"),
+	})
+	if err != nil {
+		return 0, err
+	}
+	for taskIter.First(); taskIter.Valid(); taskIter.Next() {
+		var task model.OfflineTask
+		if err := json.Unmarshal(taskIter.Value(), &task); err != nil {
+			continue
+		}
+		if isTerminalTaskStatus(task.Status) && !task.UpdatedAt.IsZero() && task.UpdatedAt.Before(cutoff) {
+			expired[task.TaskID] = struct{}{}
+		}
+	}
+	iterErr := taskIter.Error()
+	_ = taskIter.Close()
+	if iterErr != nil {
+		return 0, iterErr
+	}
+	if len(expired) == 0 {
+		return 0, nil
+	}
+
+	shardKeys := make([][]byte, 0)
+	shardIter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(prefixShard),
+		UpperBound: []byte(prefixShard + "\xff"),
+	})
+	if err != nil {
+		return 0, err
+	}
+	for shardIter.First(); shardIter.Valid(); shardIter.Next() {
+		var shard model.TaskShard
+		if err := json.Unmarshal(shardIter.Value(), &shard); err != nil {
+			continue
+		}
+		if _, ok := expired[shard.TaskID]; ok {
+			key := append([]byte(nil), shardIter.Key()...)
+			shardKeys = append(shardKeys, key)
+		}
+	}
+	iterErr = shardIter.Error()
+	_ = shardIter.Close()
+	if iterErr != nil {
+		return 0, iterErr
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	for _, key := range shardKeys {
+		if err := batch.Delete(key, nil); err != nil {
+			return 0, err
+		}
+	}
+	for taskID := range expired {
+		if err := batch.Delete([]byte(prefixTask+taskID), nil); err != nil {
+			return 0, err
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return 0, err
+	}
+	return len(expired), nil
+}
+
+func isTerminalTaskStatus(status string) bool {
+	switch status {
+	case model.TaskStatusSuccess, model.TaskStatusFailed, model.TaskStatusCanceled:
+		return true
+	default:
+		return false
+	}
 }

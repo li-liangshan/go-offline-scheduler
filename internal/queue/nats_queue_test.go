@@ -67,11 +67,25 @@ func TestPublish(t *testing.T) {
 	require.Equal(t, req, &got)
 }
 
+func TestSubmitTaskUsesPublish(t *testing.T) {
+	js := &fakeJetStream{}
+	q := &NatsQueue{js: js}
+	req := &model.SubmitTaskRequest{TaskID: "async-task", TotalShard: 1}
+	require.NoError(t, q.SubmitTask(req))
+	require.Equal(t, subject, js.publishSubject)
+}
+
 func TestPublishReturnsError(t *testing.T) {
 	js := &fakeJetStream{publishErr: errors.New("publish failed")}
 	q := &NatsQueue{js: js}
 
 	require.Error(t, q.Publish(&model.SubmitTaskRequest{TaskID: "task-1"}))
+}
+
+func TestPublishRejectsNilRequest(t *testing.T) {
+	q := &NatsQueue{js: &fakeJetStream{}}
+
+	require.Error(t, q.Publish(nil))
 }
 
 func TestSubscribeRegistersHandlers(t *testing.T) {
@@ -117,6 +131,14 @@ func TestSubscribeReturnsQueueSubscribeError(t *testing.T) {
 	require.Error(t, q.Subscribe(context.Background(), func(req *model.SubmitTaskRequest) error { return nil }))
 }
 
+func TestSubscribeRejectsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	q := &NatsQueue{js: &fakeJetStream{}}
+
+	require.ErrorIs(t, q.Subscribe(ctx, func(req *model.SubmitTaskRequest) error { return nil }), context.Canceled)
+}
+
 func TestSubscribeHandlerErrorNaksMessage(t *testing.T) {
 	logger.InitLogger()
 	js := &fakeJetStream{}
@@ -148,4 +170,14 @@ func TestNewNatsQueueConnectionError(t *testing.T) {
 	q, err := NewNatsQueue("nats://127.0.0.1:0")
 	require.Error(t, err)
 	require.Nil(t, q)
+}
+
+func TestStopSubscribeWithoutSubscriptions(t *testing.T) {
+	q := &NatsQueue{}
+	require.NotPanics(t, q.StopSubscribe)
+}
+
+func TestMergeSubjects(t *testing.T) {
+	got := mergeSubjects([]string{"a", "b"}, []string{"b", "c", ""})
+	require.Equal(t, []string{"a", "b", "c"}, got)
 }

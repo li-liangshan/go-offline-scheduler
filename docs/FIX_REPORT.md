@@ -170,26 +170,32 @@ internal/store/pebble_store_test.go
 
 | 包 | 覆盖率 |
 | --- | --- |
-| `cmd/scheduler` | 5.3% |
-| `internal/api` | 90.8% |
-| `internal/config` | 100.0% |
-| `internal/leader` | 80.0% |
-| `internal/logger` | 100.0% |
+| `cmd/scheduler` | 12.4% |
+| `internal/api` | 86.6% |
+| `internal/config` | 87.0% |
+| `internal/leader` | 78.0% |
+| `internal/logger` | 92.3% |
 | `internal/metric` | 无语句 |
 | `internal/model` | 无语句 |
 | `internal/otel` | 81.8% |
-| `internal/queue` | 58.5% |
-| `internal/resourcecheck` | 100.0% |
-| `internal/scheduler` | 82.2% |
-| `internal/store` | 73.5% |
+| `internal/queue` | 63.2% |
+| `internal/resourcecheck` | 94.6% |
+| `internal/scheduler` | 80.7% |
+| `internal/store` | 75.3% |
 
 `cmd/scheduler` 的覆盖率较低，因为 `main()` 包含完整的 K8s、NATS、HTTP 启动流程，不适合在单元测试中直接执行；其 kubeconfig 构造逻辑已单独测试。
 
 ## 四、变更文件
 
 ```text
+Dockerfile
+.dockerignore
 cmd/scheduler/main.go
 configs/rbac.yaml
+configs/deployment.yaml
+configs/config.yaml
+docs/FIX_REPORT.md
+docs/PRODUCTION_READINESS.md
 internal/api/http_api.go
 internal/api/http_api_test.go
 internal/config/config_test.go
@@ -217,18 +223,31 @@ cmd/scheduler/main_test.go
 test.sh
 ```
 
-## 五、剩余架构限制
+## 五、生产级改造补充
 
-当前多副本部署仍使用各实例本地 PebbleDB。若任务提交请求落到 follower：
+在完成上述缺陷修复后，项目又进行了一轮面向生产运行的改造：
 
-- 任务元数据只会写入 follower 的本地数据库。
-- Leader 的本地数据库不会自动获得该任务。
-- Leader 因此无法调度该任务。
+- 配置系统支持默认值、环境变量覆盖和启动校验。
+- HTTP 提交改为先写入 NATS JetStream，增加鉴权、请求体限制、健康检查和就绪检查。
+- JetStream 使用文件存储，支持配置最大投递次数和消息保留时长，DLQ 发布失败不丢消息。
+- Leader 启动时恢复未完成任务，并回收 Kubernetes 中已不存在的孤儿分片。
+- 任务与分片的创建、取消使用批量原子写入，避免部分写入导致状态不一致。
+- 增加终态任务保留策略和定时清理，防止 Pebble 数据无限增长。
+- 增加 Dockerfile、Kubernetes Deployment、探针、安全上下文和 PVC 示例。
+- 全量执行 `go build`、`go test`、`go vet`、`go test -race` 并通过。
 
-要彻底支持多副本高可用，需要在以下方案中选择一种：
+详细的生产检查清单、验证结果和已知限制见
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md)。
 
-1. 使用所有副本共享的持久化存储。
-2. 仅允许 Leader 接收 HTTP 提交。
-3. 仅允许 Leader 消费 NATS JetStream 任务消息，follower 返回重试或转发请求。
+## 六、剩余架构限制
 
-该问题属于架构层面的存储与请求路由限制，本次未改变现有单实例存储模型。
+当前任务与分片状态仍保存在实例本地 PebbleDB：
+
+- Pebble 同一时间只允许一个进程打开同一数据目录，因此默认部署保持单副本。
+- HTTP 提交已通过 NATS 持久化，实例故障时已接收消息不会丢失。
+- 任务元数据仍依赖 PVC 恢复；PVC 丢失时需要从 Pebble Checkpoint 备份恢复。
+- follower 不持有完整本地状态，不应直接服务查询和取消请求。
+
+要彻底支持多副本无损故障切换，需要将任务和分片状态迁移到共享存储，
+例如 PostgreSQL、etcd 或 NATS KV，并增加对应的索引和事务语义。
+在完成共享存储改造前，不建议直接扩大 `replicas`。

@@ -19,6 +19,9 @@ func TestCountersCanBeIncremented(t *testing.T) {
 		"job_create_ok":      JobCreateOk,
 		"job_create_err":     JobCreateErr,
 		"shard_launch_panic": ShardLaunchPanic,
+		"tasks_queued":       TasksQueued,
+		"shards_running":     ShardsRunning,
+		"scheduler_running":  SchedulerRunning,
 	}
 
 	for name, counter := range counters {

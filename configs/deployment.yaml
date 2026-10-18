@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: offline-job
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: offline-scheduler-config
+  namespace: offline-job
+data:
+  config.yaml: |
+    namespace: offline-job
+    globalMaxConcurrency: 50
+
+    httpListenAddr: ":8080"
+    httpReadHeaderTimeoutSec: 5
+    httpReadTimeoutSec: 30
+    httpWriteTimeoutSec: 30
+    httpIdleTimeoutSec: 60
+    httpMaxBodyBytes: 1048576
+    # 建议通过 Secret 挂载后使用 SCHEDULER_APIAUTHTOKEN 覆盖
+    apiAuthToken: ""
+
+    natsUrl: "nats://nats.offline-job.svc:4222"
+    natsMaxDeliver: 5
+    natsStreamMaxAgeSec: 86400
+
+    pebbleDataPath: "/data/pebble"
+    pebbleCacheMB: 64
+    backupDir: "/backup"
+    backupIntervalSec: 3600
+    backupTimeoutSec: 600
+    backupRetainCount: 24
+
+    taskRetentionSec: 2592000
+    cleanupIntervalSec: 600
+
+    leaseName: offline-scheduler-leader
+    otelEndpoint: "otel-collector.observability.svc:4318"
+    logLevel: info
+
+    # 必须替换为真实镜像
+    workerImage: "registry.example.com/offline-worker:latest"
+    workerImagePullPolicy: IfNotPresent
+    workerCpuRequest: 500m
+    workerCpuLimit: "2"
+    workerMemoryRequest: 1Gi
+    workerMemoryLimit: 4Gi
+    workerServiceAccount: ""
+    jobTtlSecondsAfterFinished: 3600
+    deleteFinishedJobs: false
+    resourceCheckEnabled: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: offline-scheduler
+  namespace: offline-job
+  labels:
+    app: offline-scheduler
+spec:
+  # Pebble 是本地状态存储。默认单副本运行；多副本需要先引入共享状态存储。
+  replicas: 1
+  selector:
+    matchLabels:
+      app: offline-scheduler
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: offline-scheduler
+    spec:
+      serviceAccountName: offline-scheduler-sa
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+      containers:
+      - name: scheduler
+        image: offline-scheduler:latest
+        imagePullPolicy: IfNotPresent
+        args: ["-config=/etc/offline-scheduler/config.yaml"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - name: http
+          containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: "2"
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: config
+          mountPath: /etc/offline-scheduler
+          readOnly: true
+        - name: data
+          mountPath: /data
+        - name: backup
+          mountPath: /backup
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: config
+        configMap:
+          name: offline-scheduler-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: offline-scheduler-data
+      - name: backup
+        persistentVolumeClaim:
+          claimName: offline-scheduler-backup
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: offline-scheduler-data
+  namespace: offline-job
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: offline-scheduler-backup
+  namespace: offline-job
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: offline-scheduler
+  namespace: offline-job
+  labels:
+    app: offline-scheduler
+spec:
+  selector:
+    app: offline-scheduler
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http

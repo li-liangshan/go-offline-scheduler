@@ -1,0 +1,5 @@
+.git
+pebble-data
+pebble-backup
+*.log
+FIX_REPORT.md

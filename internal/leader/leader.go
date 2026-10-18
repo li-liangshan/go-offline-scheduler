@@ -56,6 +56,12 @@ func NewLeaderElector(client kubernetes.Interface, cfg Config, becomeLeader func
 	if cfg.RetryPeriod <= 0 {
 		cfg.RetryPeriod = 2 * time.Second
 	}
+	if cfg.LeaseDuration <= cfg.RenewDeadline {
+		return nil, fmt.Errorf("leaseDuration must be greater than renewDeadline")
+	}
+	if cfg.RenewDeadline <= cfg.RetryPeriod {
+		return nil, fmt.Errorf("renewDeadline must be greater than retryPeriod")
+	}
 	if cfg.Identity == "" {
 		// fallback，生产环境优先传入pod name
 		if hostname, err := os.Hostname(); err == nil && hostname != "" {

@@ -102,6 +102,15 @@ func TestSaveTaskWithShards(t *testing.T) {
 	require.Len(t, gotShards, 2)
 }
 
+func TestCreateTaskWithShardsIsIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	task := &model.OfflineTask{TaskID: "idempotent", TotalShard: 1, Status: model.TaskStatusPending}
+	shards := []*model.TaskShard{{ShardID: "idempotent-shard-0", TaskID: "idempotent", Status: model.ShardStatusPending}}
+	require.NoError(t, st.CreateTaskWithShards(task, shards))
+	err := st.CreateTaskWithShards(task, shards)
+	require.ErrorIs(t, err, ErrTaskExists)
+}
+
 func TestStoreNotFoundSentinels(t *testing.T) {
 	st := newTestStore(t)
 	_, err := st.GetTask("missing")
@@ -109,4 +118,62 @@ func TestStoreNotFoundSentinels(t *testing.T) {
 
 	_, err = st.GetShard("missing")
 	require.True(t, errors.Is(err, ErrShardNotFound))
+}
+
+func TestStoreListTasksAndHealth(t *testing.T) {
+	st := newTestStore(t)
+	require.NoError(t, st.Healthy())
+	require.NoError(t, st.SaveTask(&model.OfflineTask{TaskID: "task-1", Status: model.TaskStatusPending}))
+	require.NoError(t, st.SaveTask(&model.OfflineTask{TaskID: "task-2", Status: model.TaskStatusSuccess}))
+
+	tasks, err := st.ListTasks()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	ids := map[string]bool{}
+	for _, task := range tasks {
+		ids[task.TaskID] = true
+	}
+	require.True(t, ids["task-1"])
+	require.True(t, ids["task-2"])
+}
+
+func TestNewStoreWithCacheMB(t *testing.T) {
+	st, err := NewStoreWithCacheMB(filepath.Join(t.TempDir(), "db"), 8)
+	require.NoError(t, err)
+	require.NotNil(t, st.DB())
+	require.NoError(t, st.Healthy())
+	require.NoError(t, st.Close())
+}
+
+func TestDeleteTerminalTasksBefore(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-time.Hour)
+
+	tasks := []*model.OfflineTask{
+		{TaskID: "old-success", Status: model.TaskStatusSuccess, UpdatedAt: old},
+		{TaskID: "old-canceled", Status: model.TaskStatusCanceled, UpdatedAt: old},
+		{TaskID: "old-pending", Status: model.TaskStatusPending, UpdatedAt: old},
+		{TaskID: "recent-success", Status: model.TaskStatusSuccess, UpdatedAt: recent},
+	}
+	for _, task := range tasks {
+		shard := &model.TaskShard{ShardID: task.TaskID + "-shard-0", TaskID: task.TaskID, Status: model.ShardStatusSuccess, UpdatedAt: task.UpdatedAt}
+		require.NoError(t, st.SaveTaskWithShards(task, []*model.TaskShard{shard}))
+	}
+
+	deleted, err := st.DeleteTerminalTasksBefore(now.Add(-24 * time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, 2, deleted)
+
+	for _, taskID := range []string{"old-success", "old-canceled"} {
+		_, err := st.GetTask(taskID)
+		require.ErrorIs(t, err, ErrTaskNotFound)
+		_, err = st.GetShard(taskID + "-shard-0")
+		require.ErrorIs(t, err, ErrShardNotFound)
+	}
+	for _, taskID := range []string{"old-pending", "recent-success"} {
+		_, err := st.GetTask(taskID)
+		require.NoError(t, err)
+	}
 }

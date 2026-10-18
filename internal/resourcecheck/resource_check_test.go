@@ -79,3 +79,22 @@ func TestCheckReturnsClientError(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, ok)
 }
+
+func TestCheckAccountsForExistingWorkerPods(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-1", Namespace: "default", Labels: map[string]string{"app": "offline-worker"}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("7"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+		}}}},
+	}
+	client := fake.NewSimpleClientset(testNode(), pod)
+	checker := NewResourceChecker(client, "default")
+	task := &model.OfflineTask{TaskID: "task", TotalShard: 10, Concurrency: 1}
+
+	ok, err := checker.Check(task, resource.MustParse("2"), resource.MustParse("1Gi"))
+	require.Error(t, err)
+	require.False(t, ok)
+}

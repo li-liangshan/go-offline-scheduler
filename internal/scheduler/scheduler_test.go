@@ -340,3 +340,103 @@ func TestFinalizeDoesNotOverwriteCanceledTask(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, model.TaskStatusCanceled, task.Status)
 }
+
+func TestNormalizeSubmitRequest(t *testing.T) {
+	req, err := NormalizeSubmitRequest(&model.SubmitTaskRequest{
+		TaskID:     "  normalized  ",
+		TotalShard: 3,
+		Priority:   99,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "normalized", req.TaskID)
+	require.Equal(t, 3, req.Concurrency)
+	require.Equal(t, 0, req.MaxRetry)
+	require.Equal(t, int64(defaultTaskTimeout), req.TimeoutSec)
+	require.Equal(t, model.PriorityNormal, req.Priority)
+
+	_, err = NormalizeSubmitRequest(&model.SubmitTaskRequest{TaskID: "bad task", TotalShard: 1})
+	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+func TestSubmitTaskTypedErrors(t *testing.T) {
+	sched, _, _ := newTestScheduler(t)
+	err := sched.SubmitTask(&model.SubmitTaskRequest{TotalShard: 1})
+	require.ErrorIs(t, err, ErrInvalidRequest)
+
+	req := &model.SubmitTaskRequest{TaskID: "duplicate-typed", TotalShard: 1, TimeoutSec: 60}
+	require.NoError(t, sched.SubmitTask(req))
+	err = sched.SubmitTask(req)
+	require.ErrorIs(t, err, ErrTaskExists)
+}
+
+func TestBuildK8sJobUsesProductOptions(t *testing.T) {
+	sched, _, _ := newTestScheduler(t)
+	sched.options.WorkerImage = "registry.example.com/worker:v2"
+	sched.options.ImagePullPolicy = corev1.PullAlways
+	sched.options.ServiceAccountName = "worker-sa"
+	sched.options.JobTTLSecondsAfterFinished = 120
+	sched.options.WorkerResources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("250m"),
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1"),
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
+		},
+	}
+
+	task := &model.OfflineTask{TaskID: "job-options", TimeoutSec: 60, Params: map[string]string{"FOO": "bar"}}
+	shard := &model.TaskShard{ShardID: "job-options-shard-0", ShardIndex: 0, K8sJobName: "offline-job-options-shard-0-r0"}
+	job := sched.buildK8sJob(task, shard)
+
+	container := job.Spec.Template.Spec.Containers[0]
+	require.Equal(t, "registry.example.com/worker:v2", container.Image)
+	require.Equal(t, corev1.PullAlways, container.ImagePullPolicy)
+	require.Equal(t, "worker-sa", job.Spec.Template.Spec.ServiceAccountName)
+	require.Equal(t, int32(120), *job.Spec.TTLSecondsAfterFinished)
+	requestCPU := container.Resources.Requests[corev1.ResourceCPU]
+	limitMemory := container.Resources.Limits[corev1.ResourceMemory]
+	require.Equal(t, "250m", requestCPU.String())
+	require.Equal(t, "2Gi", limitMemory.String())
+	require.Equal(t, "offline-scheduler", job.Labels["app.kubernetes.io/managed-by"])
+}
+
+func TestRecoverStateEnqueuesPendingTask(t *testing.T) {
+	sched, st, client := newTestScheduler(t)
+	require.NoError(t, sched.SubmitTask(&model.SubmitTaskRequest{
+		TaskID:      "recover-pending",
+		TotalShard:  1,
+		Concurrency: 1,
+		TimeoutSec:  60,
+	}))
+
+	restarted := NewScheduler(client, st, resourcecheck.NewResourceChecker(client, "default"), "default", 10)
+	restarted.recoverState()
+	require.Equal(t, 1, restarted.priorityQueue.Len())
+	restarted.scheduleLoopOnce()
+	require.Len(t, listJobs(t, client), 1)
+}
+
+func TestRecoverStateMarksOrphanedShardFailed(t *testing.T) {
+	sched, st, client := newTestScheduler(t)
+	require.NoError(t, sched.SubmitTask(&model.SubmitTaskRequest{
+		TaskID:      "recover-orphan",
+		TotalShard:  1,
+		Concurrency: 1,
+		TimeoutSec:  60,
+	}))
+	sched.scheduleLoopOnce()
+	shard := runningShard(t, st, "recover-orphan")
+	require.NoError(t, client.BatchV1().Jobs("default").Delete(context.Background(), shard.K8sJobName, metav1.DeleteOptions{}))
+
+	restarted := NewScheduler(client, st, resourcecheck.NewResourceChecker(client, "default"), "default", 10)
+	require.Equal(t, 9, restarted.globalFree())
+	restarted.recoverState()
+	require.Equal(t, 10, restarted.globalFree())
+
+	shard, err := st.GetShard(shard.ShardID)
+	require.NoError(t, err)
+	require.Equal(t, model.ShardStatusFailed, shard.Status)
+	require.Equal(t, 1, shard.RetryCount)
+}

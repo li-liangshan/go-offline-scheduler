@@ -27,12 +27,85 @@ import (
 )
 
 const (
-	defaultPodCPU        = "2"
-	defaultPodMemory     = "4Gi"
-	defaultTaskTimeout   = 3600
-	scanInterval         = 1 * time.Second
-	timeoutCheckInterval = 10 * time.Second
+	defaultTaskTimeout  = 3600
+	defaultScanInterval = 1 * time.Second
+	defaultTimeoutCheck = 10 * time.Second
+	defaultPodCPU       = "2"
+	defaultPodMemory    = "4Gi"
+	k8sCallTimeout      = 10 * time.Second
 )
+
+var (
+	// ErrInvalidRequest 表示提交或取消参数不合法。
+	ErrInvalidRequest = errors.New("invalid request")
+	// ErrTaskExists 表示相同 taskId 已存在，可用于 HTTP 409 和 NATS 幂等确认。
+	ErrTaskExists = errors.New("task already exists")
+	// ErrTaskFinished 表示任务已经进入终态，不能再次取消。
+	ErrTaskFinished = errors.New("task already finished")
+)
+
+// Options 调度器的生产运行参数。
+type Options struct {
+	GlobalMaxConcurrency       int
+	WorkerImage                string
+	ImagePullPolicy            corev1.PullPolicy
+	WorkerResources            corev1.ResourceRequirements
+	ServiceAccountName         string
+	DeleteFinishedJobs         bool
+	JobTTLSecondsAfterFinished int32
+	ScanInterval               time.Duration
+	TimeoutCheckInterval       time.Duration
+	CleanupInterval            time.Duration
+	TaskRetention              time.Duration
+	ResourceCheckEnabled       bool
+}
+
+// DefaultOptions 保留旧构造函数的行为，方便测试与本地开发。
+func DefaultOptions(globalMaxConcurrency int) Options {
+	cpu := resource.MustParse(defaultPodCPU)
+	mem := resource.MustParse(defaultPodMemory)
+	resources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: mem},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: mem},
+	}
+	return Options{
+		GlobalMaxConcurrency: globalMaxConcurrency,
+		WorkerImage:          "your-worker-image:latest",
+		ImagePullPolicy:      corev1.PullIfNotPresent,
+		WorkerResources:      resources,
+		DeleteFinishedJobs:   true,
+		ScanInterval:         defaultScanInterval,
+		TimeoutCheckInterval: defaultTimeoutCheck,
+		CleanupInterval:      10 * time.Minute,
+		TaskRetention:        30 * 24 * time.Hour,
+		ResourceCheckEnabled: true,
+	}
+}
+
+func normalizeOptions(opts Options) Options {
+	if opts.GlobalMaxConcurrency <= 0 {
+		opts.GlobalMaxConcurrency = 1
+	}
+	if opts.WorkerImage == "" {
+		opts.WorkerImage = "your-worker-image:latest"
+	}
+	if opts.ImagePullPolicy == "" {
+		opts.ImagePullPolicy = corev1.PullIfNotPresent
+	}
+	if opts.ScanInterval <= 0 {
+		opts.ScanInterval = defaultScanInterval
+	}
+	if opts.TimeoutCheckInterval <= 0 {
+		opts.TimeoutCheckInterval = defaultTimeoutCheck
+	}
+	if opts.CleanupInterval <= 0 {
+		opts.CleanupInterval = 10 * time.Minute
+	}
+	if opts.TaskRetention < 0 {
+		opts.TaskRetention = 0
+	}
+	return opts
+}
 
 // PriorityTaskItem 优先级堆元素
 type PriorityTaskItem struct {
@@ -81,18 +154,23 @@ type Scheduler struct {
 	cancelFunc context.CancelFunc
 	running    bool
 	wg         sync.WaitGroup
+
+	options Options
 }
 
 func NewScheduler(k8sClient kubernetes.Interface, st *store.Store, rc *resourcecheck.ResourceChecker, ns string, globalMaxConcurrency int) *Scheduler {
-	if globalMaxConcurrency <= 0 {
-		globalMaxConcurrency = 1
-	}
+	return NewSchedulerWithOptions(k8sClient, st, rc, ns, DefaultOptions(globalMaxConcurrency))
+}
+
+func NewSchedulerWithOptions(k8sClient kubernetes.Interface, st *store.Store, rc *resourcecheck.ResourceChecker, ns string, opts Options) *Scheduler {
+	opts = normalizeOptions(opts)
 	runningShards := 0
 	if st != nil {
 		if shards, err := st.ListAllRunningShards(); err == nil {
 			runningShards = len(shards)
 		}
 	}
+	metric.ShardsRunning.Set(float64(runningShards))
 	return &Scheduler{
 		k8sClient:      k8sClient,
 		store:          st,
@@ -100,8 +178,9 @@ func NewScheduler(k8sClient kubernetes.Interface, st *store.Store, rc *resourcec
 		namespace:      ns,
 		priorityQueue:  make(PriorityQueue, 0),
 		queuedTasks:    make(map[string]struct{}),
-		maxConcurrency: globalMaxConcurrency,
+		maxConcurrency: opts.GlobalMaxConcurrency,
 		runningShards:  runningShards,
+		options:        opts,
 	}
 }
 
@@ -120,10 +199,13 @@ func (s *Scheduler) Run() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancelFunc = cancel
 	s.running = true
+	metric.SchedulerRunning.Set(1)
+	s.recoverState()
 
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.scheduleLoop(ctx)
 	go s.timeoutLoop(ctx)
+	go s.cleanupLoop(ctx)
 	logger.S.Infow("scheduler run started", "globalMaxConcurrency", s.maxConcurrency)
 }
 
@@ -138,12 +220,13 @@ func (s *Scheduler) Stop() {
 	s.cancelFunc()
 	s.wg.Wait()
 	s.running = false
+	metric.SchedulerRunning.Set(0)
 	logger.S.Info("scheduler stopped complete")
 }
 
 func (s *Scheduler) scheduleLoop(ctx context.Context) {
 	defer s.wg.Done()
-	ticker := time.NewTicker(scanInterval)
+	ticker := time.NewTicker(s.options.ScanInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -156,9 +239,84 @@ func (s *Scheduler) scheduleLoop(ctx context.Context) {
 	}
 }
 
+// recoverState 在成为 Leader 后恢复内存队列，并核对运行中分片对应的 Job 是否仍然存在。
+func (s *Scheduler) recoverState() {
+	if s.store == nil {
+		return
+	}
+	tasks, err := s.store.ListTasks()
+	if err != nil {
+		logger.L.Error("recover tasks failed", zap.Error(err))
+	} else {
+		recovered := 0
+		for _, task := range tasks {
+			if !isTaskTerminal(task.Status) {
+				s.enqueueTask(task)
+				recovered++
+			}
+		}
+		if recovered > 0 {
+			logger.S.Infow("recovered tasks into scheduler queue", "count", recovered)
+		}
+	}
+
+	runningShards, err := s.store.ListAllRunningShards()
+	if err != nil {
+		logger.L.Error("recover running shards failed", zap.Error(err))
+		return
+	}
+	// Leader 重新当选时不能沿用上一次运行的内存计数，以存储中的真实状态为准。
+	s.runningMu.Lock()
+	s.runningShards = len(runningShards)
+	metric.ShardsRunning.Set(float64(s.runningShards))
+	s.runningMu.Unlock()
+	orphaned := 0
+	for _, listed := range runningShards {
+		callCtx, cancel := s.k8sCallContext()
+		job, getErr := s.k8sClient.BatchV1().Jobs(s.namespace).Get(callCtx, listed.K8sJobName, metav1.GetOptions{})
+		cancel()
+		if apierrors.IsNotFound(getErr) {
+			if s.failOrphanShard(listed.ShardID) {
+				orphaned++
+				if task, taskErr := s.store.GetTask(listed.TaskID); taskErr == nil {
+					s.enqueueTask(task)
+				}
+			}
+			continue
+		}
+		if getErr != nil {
+			logger.S.Warnw("check running shard job failed", "shardId", listed.ShardID, "job", listed.K8sJobName, "error", getErr)
+			continue
+		}
+		s.OnJobStatusUpdate(job)
+	}
+	if orphaned > 0 {
+		logger.S.Warnw("marked orphaned shards as failed", "count", orphaned)
+	}
+}
+
+func (s *Scheduler) failOrphanShard(shardID string) bool {
+	s.shardMu.Lock()
+	defer s.shardMu.Unlock()
+	shard, err := s.store.GetShard(shardID)
+	if err != nil || shard.Status != model.ShardStatusRunning {
+		return false
+	}
+	shard.Status = model.ShardStatusFailed
+	shard.RetryCount++
+	shard.UpdatedAt = time.Now()
+	if err := s.store.SaveShard(shard); err != nil {
+		logger.S.Errorw("save orphaned shard failed", "shardId", shardID, "error", err)
+		return false
+	}
+	s.releaseRunningSlot()
+	logger.S.Warnw("running shard job not found, marked failed", "taskId", shard.TaskID, "shardId", shardID)
+	return true
+}
+
 func (s *Scheduler) timeoutLoop(ctx context.Context) {
 	defer s.wg.Done()
-	ticker := time.NewTicker(timeoutCheckInterval)
+	ticker := time.NewTicker(s.options.TimeoutCheckInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -166,6 +324,33 @@ func (s *Scheduler) timeoutLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.checkShardTimeout()
+		}
+	}
+}
+
+// cleanupLoop 定期清理超过保留期的终态任务，防止 Pebble 数据无限增长。
+func (s *Scheduler) cleanupLoop(ctx context.Context) {
+	defer s.wg.Done()
+	if s.options.TaskRetention <= 0 {
+		return
+	}
+	ticker := time.NewTicker(s.options.CleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-s.options.TaskRetention)
+			deleted, err := s.store.DeleteTerminalTasksBefore(cutoff)
+			if err != nil {
+				logger.L.Error("cleanup expired tasks failed", zap.Error(err))
+				continue
+			}
+			if deleted > 0 {
+				metric.TasksDeleted.Add(float64(deleted))
+				logger.S.Infow("expired tasks cleaned up", "count", deleted, "cutoff", cutoff)
+			}
 		}
 	}
 }
@@ -181,6 +366,7 @@ func (s *Scheduler) enqueueTask(task *model.OfflineTask) {
 	}
 	heap.Push(&s.priorityQueue, &PriorityTaskItem{task: task})
 	s.queuedTasks[task.TaskID] = struct{}{}
+	metric.TasksQueued.Set(float64(s.priorityQueue.Len()))
 }
 
 func (s *Scheduler) popTask() *model.OfflineTask {
@@ -191,6 +377,7 @@ func (s *Scheduler) popTask() *model.OfflineTask {
 	}
 	item := heap.Pop(&s.priorityQueue).(*PriorityTaskItem)
 	delete(s.queuedTasks, item.task.TaskID)
+	metric.TasksQueued.Set(float64(s.priorityQueue.Len()))
 	return item.task
 }
 
@@ -203,6 +390,7 @@ func (s *Scheduler) globalFree() int {
 func (s *Scheduler) addRunningSlot() {
 	s.runningMu.Lock()
 	s.runningShards++
+	metric.ShardsRunning.Set(float64(s.runningShards))
 	s.runningMu.Unlock()
 }
 
@@ -211,56 +399,25 @@ func (s *Scheduler) releaseRunningSlot() {
 	if s.runningShards > 0 {
 		s.runningShards--
 	}
+	metric.ShardsRunning.Set(float64(s.runningShards))
 	s.runningMu.Unlock()
 }
 
 // SubmitTask 外部http/nats入口提交任务
 func (s *Scheduler) SubmitTask(req *model.SubmitTaskRequest) error {
-	if req == nil {
-		return fmt.Errorf("request cannot be nil")
+	normalized, err := NormalizeSubmitRequest(req)
+	if err != nil {
+		return err
 	}
-	if s.store == nil || s.resChecker == nil {
+	req = normalized
+	if s.store == nil || (s.options.ResourceCheckEnabled && s.resChecker == nil) {
 		return fmt.Errorf("scheduler is not initialized")
 	}
 
-	taskID := strings.TrimSpace(req.TaskID)
-	if taskID == "" {
-		return fmt.Errorf("taskId is required")
-	}
-	if errs := validation.IsValidLabelValue(taskID); len(errs) > 0 {
-		return fmt.Errorf("invalid taskId: %s", strings.Join(errs, ", "))
-	}
-	if req.TotalShard <= 0 {
-		return fmt.Errorf("totalShard must be greater than 0")
-	}
-	for key := range req.Params {
-		if errs := validation.IsEnvVarName(key); len(errs) > 0 {
-			return fmt.Errorf("invalid param name %q: %s", key, strings.Join(errs, ", "))
-		}
-	}
-
-	concurrency := req.Concurrency
-	if concurrency <= 0 {
-		concurrency = req.TotalShard
-	}
-	if concurrency > req.TotalShard {
-		concurrency = req.TotalShard
-	}
-	maxRetry := req.MaxRetry
-	if maxRetry < 0 {
-		maxRetry = 0
-	}
-	timeoutSec := req.TimeoutSec
-	if timeoutSec <= 0 {
-		timeoutSec = defaultTaskTimeout
-	}
-	priority := req.Priority
-	if priority < model.PriorityLow || priority > model.PriorityHigh {
-		priority = model.PriorityNormal
-	}
+	taskID := req.TaskID
 
 	if _, err := s.store.GetTask(taskID); err == nil {
-		return fmt.Errorf("task %s already exists", taskID)
+		return fmt.Errorf("%w: %s", ErrTaskExists, taskID)
 	} else if !errors.Is(err, store.ErrTaskNotFound) {
 		return err
 	}
@@ -269,27 +426,29 @@ func (s *Scheduler) SubmitTask(req *model.SubmitTaskRequest) error {
 	task := &model.OfflineTask{
 		TaskID:      taskID,
 		TotalShard:  req.TotalShard,
-		Concurrency: concurrency,
-		MaxRetry:    maxRetry,
-		TimeoutSec:  timeoutSec,
+		Concurrency: req.Concurrency,
+		MaxRetry:    req.MaxRetry,
+		TimeoutSec:  req.TimeoutSec,
 		Params:      req.Params,
 		Labels:      req.Labels,
-		Priority:    priority,
+		Priority:    req.Priority,
 		Status:      model.TaskStatusPending,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
 
-	cpuQ := resource.MustParse(defaultPodCPU)
-	memQ := resource.MustParse(defaultPodMemory)
-	ok, err := s.resChecker.Check(task, cpuQ, memQ)
-	if err != nil {
-		metric.TaskSubmitFailed.Inc()
-		return fmt.Errorf("resource check failed: %w", err)
-	}
-	if !ok {
-		metric.TaskSubmitFailed.Inc()
-		return fmt.Errorf("cluster resource insufficient")
+	if s.options.ResourceCheckEnabled {
+		cpuQ := s.options.WorkerResources.Requests[corev1.ResourceCPU]
+		memQ := s.options.WorkerResources.Requests[corev1.ResourceMemory]
+		ok, err := s.resChecker.Check(task, cpuQ, memQ)
+		if err != nil {
+			metric.TaskSubmitFailed.Inc()
+			return fmt.Errorf("resource check failed: %w", err)
+		}
+		if !ok {
+			metric.TaskSubmitFailed.Inc()
+			return fmt.Errorf("cluster resource insufficient")
+		}
 	}
 
 	shards := make([]*model.TaskShard, 0, task.TotalShard)
@@ -303,8 +462,11 @@ func (s *Scheduler) SubmitTask(req *model.SubmitTaskRequest) error {
 			UpdatedAt:  now,
 		})
 	}
-	if err := s.store.SaveTaskWithShards(task, shards); err != nil {
+	if err := s.store.CreateTaskWithShards(task, shards); err != nil {
 		metric.TaskSubmitFailed.Inc()
+		if errors.Is(err, store.ErrTaskExists) {
+			return fmt.Errorf("%w: %s", ErrTaskExists, taskID)
+		}
 		return err
 	}
 
@@ -429,7 +591,9 @@ func (s *Scheduler) launchShard(task *model.OfflineTask, shard *model.TaskShard)
 	s.shardMu.Unlock()
 
 	job := s.buildK8sJob(task, shard)
-	_, createErr := s.k8sClient.BatchV1().Jobs(s.namespace).Create(context.Background(), job, metav1.CreateOptions{})
+	callCtx, cancel := s.k8sCallContext()
+	_, createErr := s.k8sClient.BatchV1().Jobs(s.namespace).Create(callCtx, job, metav1.CreateOptions{})
+	cancel()
 	if createErr != nil {
 		if apierrors.IsAlreadyExists(createErr) {
 			logger.S.Warnw("shard job already exists, keep running state",
@@ -463,8 +627,12 @@ func (s *Scheduler) launchShard(task *model.OfflineTask, shard *model.TaskShard)
 	// 创建期间任务可能已被取消，及时清理刚创建的 Job。
 	if current, getErr := s.store.GetTask(task.TaskID); getErr == nil && current.Status == model.TaskStatusCanceled {
 		prop := metav1.DeletePropagationBackground
-		_ = s.k8sClient.BatchV1().Jobs(s.namespace).Delete(context.Background(), shard.K8sJobName,
-			metav1.DeleteOptions{PropagationPolicy: &prop})
+		callCtx, cancel := s.k8sCallContext()
+		if deleteErr := s.k8sClient.BatchV1().Jobs(s.namespace).Delete(callCtx, shard.K8sJobName,
+			metav1.DeleteOptions{PropagationPolicy: &prop}); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+			logger.L.Warn("delete job created for canceled task failed", zap.String("job", shard.K8sJobName), zap.Error(deleteErr))
+		}
+		cancel()
 		logger.S.Infow("task canceled during job creation, job deleted", "taskId", task.TaskID, "jobName", shard.K8sJobName)
 		return nil
 	}
@@ -485,17 +653,16 @@ func (s *Scheduler) buildK8sJob(task *model.OfflineTask, shard *model.TaskShard)
 		envList = append(envList, corev1.EnvVar{Name: k, Value: v})
 	}
 
-	cpu := resource.MustParse(defaultPodCPU)
-	mem := resource.MustParse(defaultPodMemory)
-
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      shard.K8sJobName,
 			Namespace: s.namespace,
 			Labels: map[string]string{
-				"task-id":  task.TaskID,
-				"shard-id": shard.ShardID,
-				"app":      "offline-worker",
+				"task-id":                      task.TaskID,
+				"shard-id":                     shard.ShardID,
+				"app":                          "offline-worker",
+				"app.kubernetes.io/name":       "offline-worker",
+				"app.kubernetes.io/managed-by": "offline-scheduler",
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -509,28 +676,26 @@ func (s *Scheduler) buildK8sJob(task *model.OfflineTask, shard *model.TaskShard)
 					},
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					RestartPolicy:      corev1.RestartPolicyNever,
+					ServiceAccountName: s.options.ServiceAccountName,
 					Containers: []corev1.Container{
 						{
-							Name:  "worker",
-							Image: "your-worker-image:latest",
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    cpu,
-									corev1.ResourceMemory: mem,
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    cpu,
-									corev1.ResourceMemory: mem,
-								},
-							},
-							Env: envList,
+							Name:            "worker",
+							Image:           s.options.WorkerImage,
+							ImagePullPolicy: s.options.ImagePullPolicy,
+							Resources:       s.options.WorkerResources,
+							Env:             envList,
 						},
 					},
 				},
 			},
 		},
 	}
+	if s.options.JobTTLSecondsAfterFinished > 0 {
+		ttl := s.options.JobTTLSecondsAfterFinished
+		job.Spec.TTLSecondsAfterFinished = &ttl
+	}
+	return job
 }
 
 // OnJobStatusUpdate informer回调，Job状态变更回调入口
@@ -549,11 +714,16 @@ func (s *Scheduler) OnJobStatusUpdate(job *batchv1.Job) {
 		return
 	}
 
-	prop := metav1.DeletePropagationBackground
-	if err := s.k8sClient.BatchV1().Jobs(s.namespace).Delete(context.Background(), job.Name, metav1.DeleteOptions{
-		PropagationPolicy: &prop,
-	}); err != nil && !apierrors.IsNotFound(err) {
-		logger.L.Warn("delete finished job failed", zap.String("job", job.Name), zap.Error(err))
+	if s.options.DeleteFinishedJobs {
+		prop := metav1.DeletePropagationBackground
+		callCtx, cancel := s.k8sCallContext()
+		err := s.k8sClient.BatchV1().Jobs(s.namespace).Delete(callCtx, job.Name, metav1.DeleteOptions{
+			PropagationPolicy: &prop,
+		})
+		cancel()
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.L.Warn("delete finished job failed", zap.String("job", job.Name), zap.Error(err))
+		}
 	}
 
 	task, err := s.store.GetTask(taskID)
@@ -711,14 +881,22 @@ func (s *Scheduler) checkShardTimeout() {
 		s.shardMu.Unlock()
 
 		prop := metav1.DeletePropagationBackground
-		_ = s.k8sClient.BatchV1().Jobs(s.namespace).Delete(context.Background(), shard.K8sJobName,
-			metav1.DeleteOptions{PropagationPolicy: &prop})
+		callCtx, cancel := s.k8sCallContext()
+		if err := s.k8sClient.BatchV1().Jobs(s.namespace).Delete(callCtx, shard.K8sJobName,
+			metav1.DeleteOptions{PropagationPolicy: &prop}); err != nil && !apierrors.IsNotFound(err) {
+			logger.L.Warn("delete timed out job failed", zap.String("job", shard.K8sJobName), zap.Error(err))
+		}
+		cancel()
 		s.enqueueTask(task)
 	}
 }
 
 // CancelTask 外部取消任务接口
 func (s *Scheduler) CancelTask(taskID string) error {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return invalidf("taskId is required")
+	}
 	jobNames, err := s.cancelTaskState(taskID)
 	if err != nil {
 		return err
@@ -726,8 +904,10 @@ func (s *Scheduler) CancelTask(taskID string) error {
 
 	prop := metav1.DeletePropagationBackground
 	for _, jobName := range jobNames {
-		if err := s.k8sClient.BatchV1().Jobs(s.namespace).Delete(context.Background(), jobName,
-			metav1.DeleteOptions{PropagationPolicy: &prop}); err != nil && !apierrors.IsNotFound(err) {
+		callCtx, cancel := s.k8sCallContext()
+		err := s.k8sClient.BatchV1().Jobs(s.namespace).Delete(callCtx, jobName, metav1.DeleteOptions{PropagationPolicy: &prop})
+		cancel()
+		if err != nil && !apierrors.IsNotFound(err) {
 			logger.L.Warn("delete canceled job failed", zap.String("job", jobName), zap.Error(err))
 		}
 	}
@@ -743,12 +923,12 @@ func (s *Scheduler) cancelTaskState(taskID string) ([]string, error) {
 	task, err := s.store.GetTask(taskID)
 	if err != nil {
 		if errors.Is(err, store.ErrTaskNotFound) {
-			return nil, fmt.Errorf("task not found")
+			return nil, fmt.Errorf("%w: %s", store.ErrTaskNotFound, taskID)
 		}
 		return nil, err
 	}
 	if isTaskTerminal(task.Status) {
-		return nil, fmt.Errorf("task already finished")
+		return nil, fmt.Errorf("%w: %s", ErrTaskFinished, taskID)
 	}
 
 	shards, err := s.store.ListShardsByTaskID(taskID)
@@ -763,24 +943,27 @@ func (s *Scheduler) cancelTaskState(taskID string) ([]string, error) {
 	}
 
 	jobNames := make([]string, 0, len(shards))
-	for _, listedShard := range shards {
-		shard, err := s.store.GetShard(listedShard.ShardID)
-		if err != nil {
-			continue
-		}
+	runningReleased := 0
+	for _, shard := range shards {
 		if shard.Status == model.ShardStatusSuccess || shard.Status == model.ShardStatusCanceled {
 			continue
 		}
 		wasRunning := shard.Status == model.ShardStatusRunning
 		shard.Status = model.ShardStatusCanceled
 		shard.UpdatedAt = task.UpdatedAt
-		_ = s.store.SaveShard(shard)
 		if wasRunning {
-			s.releaseRunningSlot()
+			runningReleased++
 		}
 		if shard.K8sJobName != "" {
 			jobNames = append(jobNames, shard.K8sJobName)
 		}
+	}
+	// 任务与全部分片原子落盘；避免取消成功但部分分片仍显示 Running 而造成槽位泄漏。
+	if err := s.store.SaveTaskWithShards(task, shards); err != nil {
+		return nil, err
+	}
+	for i := 0; i < runningReleased; i++ {
+		s.releaseRunningSlot()
 	}
 	return jobNames, nil
 }
@@ -792,6 +975,54 @@ func isTaskTerminal(status string) bool {
 	default:
 		return false
 	}
+}
+
+func invalidf(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrInvalidRequest, fmt.Sprintf(format, args...))
+}
+
+func (s *Scheduler) k8sCallContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), k8sCallTimeout)
+}
+
+// NormalizeSubmitRequest 完成纯参数校验与默认值填充，不访问存储或 Kubernetes。
+// HTTP 异步提交路径可以在写入 NATS 前先调用它，避免无效消息进入队列。
+func NormalizeSubmitRequest(req *model.SubmitTaskRequest) (*model.SubmitTaskRequest, error) {
+	if req == nil {
+		return nil, invalidf("request cannot be nil")
+	}
+	normalized := *req
+	normalized.TaskID = strings.TrimSpace(normalized.TaskID)
+	if normalized.TaskID == "" {
+		return nil, invalidf("taskId is required")
+	}
+	if errs := validation.IsValidLabelValue(normalized.TaskID); len(errs) > 0 {
+		return nil, invalidf("invalid taskId: %s", strings.Join(errs, ", "))
+	}
+	if normalized.TotalShard <= 0 {
+		return nil, invalidf("totalShard must be greater than 0")
+	}
+	for key := range normalized.Params {
+		if errs := validation.IsEnvVarName(key); len(errs) > 0 {
+			return nil, invalidf("invalid param name %q: %s", key, strings.Join(errs, ", "))
+		}
+	}
+	if normalized.Concurrency <= 0 {
+		normalized.Concurrency = normalized.TotalShard
+	}
+	if normalized.Concurrency > normalized.TotalShard {
+		normalized.Concurrency = normalized.TotalShard
+	}
+	if normalized.MaxRetry < 0 {
+		normalized.MaxRetry = 0
+	}
+	if normalized.TimeoutSec <= 0 {
+		normalized.TimeoutSec = defaultTaskTimeout
+	}
+	if normalized.Priority < model.PriorityLow || normalized.Priority > model.PriorityHigh {
+		normalized.Priority = model.PriorityNormal
+	}
+	return &normalized, nil
 }
 
 func buildJobName(taskID string, shardIndex, retry int) string {

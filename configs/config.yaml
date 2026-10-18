@@ -1,10 +1,42 @@
 namespace: offline-job
 globalMaxConcurrency: 50
+
 httpListenAddr: ":8080"
+httpReadHeaderTimeoutSec: 5
+httpReadTimeoutSec: 30
+httpWriteTimeoutSec: 30
+httpIdleTimeoutSec: 60
+httpMaxBodyBytes: 1048576
+# 为空表示不启用 Bearer Token 鉴权
+apiAuthToken: ""
+
 natsUrl: "nats://127.0.0.1:4222"
+natsMaxDeliver: 5
+natsStreamMaxAgeSec: 86400
+
 pebbleDataPath: "./pebble-data"
+pebbleCacheMB: 64
 backupDir: "./pebble-backup"
+backupIntervalSec: 3600
+backupTimeoutSec: 600
+backupRetainCount: 24
+
+# 终态任务保留 30 天；设置为 0 关闭自动清理
+taskRetentionSec: 2592000
+cleanupIntervalSec: 600
+
 leaseName: offline-scheduler-leader
 otelEndpoint: "otel-collector:4318"
 logLevel: info
 
+# Worker Job 配置：生产部署必须替换为真实镜像
+workerImage: "your-worker-image:latest"
+workerImagePullPolicy: IfNotPresent
+workerCpuRequest: 500m
+workerCpuLimit: "2"
+workerMemoryRequest: 1Gi
+workerMemoryLimit: 4Gi
+workerServiceAccount: ""
+jobTtlSecondsAfterFinished: 3600
+deleteFinishedJobs: false
+resourceCheckEnabled: true
